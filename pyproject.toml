@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "miro-cli"
+version = "1.0.0"
+description = "Command-line tool for Miro board automation — 28 commands for boards, items, connectors, frames, and graph import/export"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Dowdy Sarvis"}]
+
+[project.scripts]
+miro = "miro_cli.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
