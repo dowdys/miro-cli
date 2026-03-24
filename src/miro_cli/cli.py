@@ -2,8 +2,8 @@
 """
 Miro CLI — Board management, items, connectors, and graph operations.
 
-All 28 Miro board operations exposed as CLI subcommands.
-Calls Miro API directly (no daemon required).
+All 29 Miro board operations exposed as CLI subcommands.
+Calls the Miro REST API v2 directly.
 """
 
 import argparse
@@ -14,44 +14,9 @@ from pathlib import Path
 
 from . import api
 
-# Action-to-handler mapping (replaces daemon dispatch)
-_HANDLERS = {
-    "miro.list_boards": api.handle_list_boards,
-    "miro.create_board": api.handle_create_board,
-    "miro.get_board": api.handle_get_board,
-    "miro.update_board": api.handle_update_board,
-    "miro.delete_board": api.handle_delete_board,
-    "miro.get_items": api.handle_get_all_items,
-    "miro.update_item": api.handle_update_item,
-    "miro.delete_item": api.handle_delete_item,
-    "miro.move_item": api.handle_move_item,
-    "miro.create_sticky_note": api.handle_create_sticky_note,
-    "miro.create_shape": api.handle_create_shape,
-    "miro.bulk_create": api.handle_bulk_create_items,
-    "miro.get_item_connections": api.handle_get_item_with_connections,
-    "miro.create_connector": api.handle_create_connector,
-    "miro.get_connectors": api.handle_get_connectors,
-    "miro.update_connector": api.handle_update_connector,
-    "miro.delete_connector": api.handle_delete_connector,
-    "miro.create_frame": api.handle_create_frame,
-    "miro.get_frames": api.handle_get_frames,
-    "miro.get_frame_items": api.handle_get_items_in_frame,
-    "miro.bulk_update": api.handle_bulk_update_items,
-    "miro.bulk_delete": api.handle_bulk_delete_items,
-    "miro.bulk_create_connectors": api.handle_bulk_create_connectors,
-    "miro.board_summary": api.handle_board_summary,
-    "miro.copy_board": api.handle_copy_board,
-    "miro.export_graph": api.handle_export_graph,
-    "miro.import_graph": api.handle_import_graph,
-    "miro.board_diff": api.handle_board_diff,
-}
 
-
-def send_request(action: str, params: dict = None) -> dict:
-    """Call the async handler directly (no daemon needed)."""
-    handler = _HANDLERS.get(action)
-    if not handler:
-        return {"error": f"Unknown action: {action}"}
+def _run(handler, params: dict | None = None) -> dict:
+    """Run an async handler and return the result dict."""
     try:
         return asyncio.run(handler(params or {}))
     except FileNotFoundError:
@@ -60,11 +25,11 @@ def send_request(action: str, params: dict = None) -> dict:
         return {"error": str(e)}
 
 
-def print_json(data: dict):
+def __print_json(data: dict):
     print(json.dumps(data, indent=2))
 
 
-def print_error(data: dict):
+def __print_error(data: dict):
     if "error" in data:
         print(f"Error: {data['error']}", file=sys.stderr)
         sys.exit(1)
@@ -115,11 +80,11 @@ def cmd_list_boards(args):
     params = {}
     if args.query:
         params["query"] = args.query
-    result = send_request("miro.list_boards", params)
+    result = _run(api.handle_list_boards, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         boards = result.get("boards", [])
         print(f"Boards ({len(boards)}):\n")
@@ -135,11 +100,11 @@ def cmd_create_board(args):
     params = {"name": args.name}
     if args.description:
         params["description"] = args.description
-    result = send_request("miro.create_board", params)
+    result = _run(api.handle_create_board, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         board = result.get("board", result)
         print(f"Created board: {board.get('name', '?')}")
@@ -150,11 +115,11 @@ def cmd_create_board(args):
 
 def cmd_get_board(args):
     params = {"board_id": args.board_id}
-    result = send_request("miro.get_board", params)
+    result = _run(api.handle_get_board, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         board = result.get("board", result)
         print(f"Board: {board.get('name', '?')}")
@@ -175,11 +140,11 @@ def cmd_update_board(args):
         params["name"] = args.name
     if args.description is not None:
         params["description"] = args.description
-    result = send_request("miro.update_board", params)
+    result = _run(api.handle_update_board, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         board = result.get("board", result)
         print(f"Updated board: {board.get('name', '?')} [{board.get('id', '?')}]")
@@ -187,11 +152,11 @@ def cmd_update_board(args):
 
 def cmd_delete_board(args):
     params = {"board_id": args.board_id}
-    result = send_request("miro.delete_board", params)
+    result = _run(api.handle_delete_board, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Deleted board {args.board_id} (moved to trash)")
 
@@ -206,11 +171,11 @@ def cmd_get_items(args):
         params["search"] = args.search
     if args.full:
         params["full"] = True
-    result = send_request("miro.get_all_items", params)
+    result = _run(api.handle_get_all_items, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         items = result.get("items", [])
         print(f"Items ({result.get('count', 0)}):\n")
@@ -246,22 +211,22 @@ def cmd_update_item(args):
         params["geometry"] = json.loads(args.geometry)
     if args.parent:
         params["parent"] = json.loads(args.parent)
-    result = send_request("miro.update_item", params)
+    result = _run(api.handle_update_item, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Updated item {args.item_id}")
 
 
 def cmd_delete_item(args):
     params = {"board_id": args.board_id, "item_id": args.item_id}
-    result = send_request("miro.delete_item", params)
+    result = _run(api.handle_delete_item, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Deleted item {args.item_id}")
 
@@ -272,11 +237,11 @@ def cmd_move_item(args):
         params["position"] = json.loads(args.position)
     if args.parent:
         params["parent"] = json.loads(args.parent)
-    result = send_request("miro.move_item", params)
+    result = _run(api.handle_move_item, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Moved item {args.item_id}")
 
@@ -291,11 +256,11 @@ def cmd_create_sticky(args):
         params["y"] = args.y
     if args.near:
         params["near"] = args.near
-    result = send_request("miro.create_sticky_note", params)
+    result = _run(api.handle_create_sticky_note, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         item = result.get("item", {})
         print(f"Created sticky note: {item.get('id', '?')}")
@@ -313,11 +278,11 @@ def cmd_create_shape(args):
         params["position"] = json.loads(args.position)
     if args.geometry:
         params["geometry"] = json.loads(args.geometry)
-    result = send_request("miro.create_shape", params)
+    result = _run(api.handle_create_shape, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         item = result.get("item", {})
         print(f"Created shape: {item.get('id', '?')}")
@@ -326,11 +291,11 @@ def cmd_create_shape(args):
 def cmd_bulk_create(args):
     items = json.loads(args.items)
     params = {"board_id": args.board_id, "items": items}
-    result = send_request("miro.bulk_create_items", params)
+    result = _run(api.handle_bulk_create_items, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Bulk created {result.get('count', 0)} item(s)")
         for item in result.get("created", []):
@@ -341,11 +306,11 @@ def cmd_bulk_create(args):
 
 def cmd_get_item_connections(args):
     params = {"board_id": args.board_id, "item_id": args.item_id}
-    result = send_request("miro.get_item_with_connections", params)
+    result = _run(api.handle_get_item_with_connections, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         item = result.get("item", {})
         label = item.get("content") or item.get("title") or ""
@@ -374,11 +339,11 @@ def cmd_create_connector(args):
         params["stroke_width"] = args.stroke_width
     if args.caption:
         params["caption"] = args.caption
-    result = send_request("miro.create_connector", params)
+    result = _run(api.handle_create_connector, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         c = result.get("connector", {})
         print(f"Created connector: {c.get('id', '?')}")
@@ -386,11 +351,11 @@ def cmd_create_connector(args):
 
 def cmd_get_connectors(args):
     params = {"board_id": args.board_id}
-    result = send_request("miro.get_connectors", params)
+    result = _run(api.handle_get_connectors, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         connectors = result.get("connectors", [])
         print(f"Connectors ({result.get('count', 0)}):\n")
@@ -412,22 +377,22 @@ def cmd_update_connector(args):
         params["style"] = json.loads(args.style)
     if args.caption is not None:
         params["caption"] = args.caption
-    result = send_request("miro.update_connector", params)
+    result = _run(api.handle_update_connector, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Updated connector {args.connector_id}")
 
 
 def cmd_delete_connector(args):
     params = {"board_id": args.board_id, "connector_id": args.connector_id}
-    result = send_request("miro.delete_connector", params)
+    result = _run(api.handle_delete_connector, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Deleted connector {args.connector_id}")
 
@@ -446,11 +411,11 @@ def cmd_create_frame(args):
         params["geometry"] = json.loads(args.geometry)
     if args.style:
         params["style"] = json.loads(args.style)
-    result = send_request("miro.create_frame", params)
+    result = _run(api.handle_create_frame, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         frame = result.get("frame", {})
         print(f"Created frame: {frame.get('id', '?')}")
@@ -458,11 +423,11 @@ def cmd_create_frame(args):
 
 def cmd_get_frames(args):
     params = {"board_id": args.board_id}
-    result = send_request("miro.get_frames", params)
+    result = _run(api.handle_get_frames, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         frames = result.get("frames", [])
         print(f"Frames ({result.get('count', 0)}):\n")
@@ -475,11 +440,11 @@ def cmd_get_frame_items(args):
     params = {"board_id": args.board_id, "frame_id": args.frame_id}
     if args.full:
         params["full"] = True
-    result = send_request("miro.get_items_in_frame", params)
+    result = _run(api.handle_get_items_in_frame, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         items = result.get("items", [])
         print(f"Items in frame {args.frame_id} ({result.get('count', 0)}):\n")
@@ -502,11 +467,11 @@ def cmd_get_frame_items(args):
 def cmd_bulk_update(args):
     updates = json.loads(args.updates)
     params = {"board_id": args.board_id, "updates": updates}
-    result = send_request("miro.bulk_update_items", params)
+    result = _run(api.handle_bulk_update_items, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Bulk updated {result.get('count', 0)} item(s)")
         for err in result.get("errors", []):
@@ -516,11 +481,11 @@ def cmd_bulk_update(args):
 def cmd_bulk_delete(args):
     item_ids = json.loads(args.item_ids)
     params = {"board_id": args.board_id, "item_ids": item_ids}
-    result = send_request("miro.bulk_delete_items", params)
+    result = _run(api.handle_bulk_delete_items, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Bulk deleted {result.get('count', 0)} item(s)")
         for err in result.get("errors", []):
@@ -530,11 +495,11 @@ def cmd_bulk_delete(args):
 def cmd_bulk_create_connectors(args):
     connectors = json.loads(args.connectors)
     params = {"board_id": args.board_id, "connectors": connectors}
-    result = send_request("miro.bulk_create_connectors", params)
+    result = _run(api.handle_bulk_create_connectors, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Bulk created {result.get('count', 0)} connector(s)")
         for err in result.get("errors", []):
@@ -547,11 +512,11 @@ def cmd_bulk_create_connectors(args):
 
 def cmd_board_summary(args):
     params = {"board_id": args.board_id}
-    result = send_request("miro.board_summary", params)
+    result = _run(api.handle_board_summary, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Board Summary ({args.board_id}):")
         print(f"  Total items: {result.get('totalItems', 0)}")
@@ -572,13 +537,13 @@ def cmd_copy_board(args):
         params["title"] = args.title
     if args.description:
         params["description"] = args.description
-    result = send_request("miro.copy_board", params)
+    result = _run(api.handle_copy_board, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
-        new_board = result.get("newBoard", {})
+        new_board = result.get("board", {})
         print(f"Board copied. New board ID: {new_board.get('id', '?')}")
 
 
@@ -586,17 +551,11 @@ def cmd_export_graph(args):
     params = {"board_id": args.board_id}
     if args.frame_id:
         params["frame_id"] = args.frame_id
-    if args.search:
-        params["search"] = args.search
-    if args.type:
-        params["type"] = args.type
-    if args.connected_only is not None:
-        params["connectedOnly"] = args.connected_only
-    result = send_request("miro.export_graph", params)
+    result = _run(api.handle_export_graph, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Graph: {result.get('title', '(untitled)')}")
         print(f"  Nodes: {len(result.get('nodes', []))}")
@@ -615,11 +574,11 @@ def cmd_board_diff(args):
     params = {"board_id": args.board_id}
     if args.frame_id:
         params["frame_id"] = args.frame_id
-    result = send_request("miro.board_diff", params)
+    result = _run(api.handle_board_diff, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         if result.get("firstSnapshot"):
             print(f"First snapshot saved. {result.get('currentState', {}).get('nodes', 0)} nodes, "
@@ -678,11 +637,11 @@ def cmd_import_graph(args):
     if args.x != 0 or args.y != 0:
         params["offset_x"] = args.x
         params["offset_y"] = args.y
-    result = send_request("miro.import_graph", params)
+    result = _run(api.handle_import_graph, params)
     if "error" in result:
-        print_error(result)
+        _print_error(result)
     if args.json:
-        print_json(result)
+        _print_json(result)
     else:
         print(f"Imported graph:")
         print(f"  Nodes created: {result.get('nodesCreated', 0)}")
@@ -701,7 +660,7 @@ def cmd_configure(args):
 
     if config_path.exists() and not args.force:
         existing = json.loads(config_path.read_text())
-        token_preview = existing.get("token", "")[:8] + "..."
+        token_preview = "***" + existing.get("token", "")[-4:]
         print(f"Already configured (token: {token_preview})")
         print("Run with --force to reconfigure.")
         return
@@ -720,7 +679,7 @@ def cmd_configure(args):
     print(f"\nSaved to {config_path}")
 
     # Quick test
-    result = send_request("miro.list_boards", {})
+    result = _run(api.handle_list_boards)
     if "error" in result:
         print(f"Warning: token test failed — {result['error']}", file=sys.stderr)
     else:
@@ -963,10 +922,6 @@ def main():
     p = sub.add_parser("export-graph", help="Export board as directed graph (nodes + edges)")
     p.add_argument("board_id", help="Board ID")
     p.add_argument("--frame-id", help="Scope export to a specific frame")
-    p.add_argument("--search", help="Filter nodes by text content (case-insensitive, includes 1-hop neighbors)")
-    p.add_argument("--type", choices=["sticky_note", "shape", "text", "card"], help="Filter by item type")
-    p.add_argument("--connected-only", type=lambda x: x.lower() == "true", default=None,
-                   help="Only connected nodes (default: true). Set to false for all items.")
     p.add_argument("--json", action="store_true", help="Output as JSON")
     p.set_defaults(func=cmd_export_graph)
 

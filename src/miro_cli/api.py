@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import re
+import stat
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,17 +18,9 @@ from pathlib import Path
 
 logger = logging.getLogger("miro-cli")
 
-_config = None
 _token = None
 
 MIRO_API = "https://api.miro.com/v2"
-
-# Sticky note color enum
-STICKY_COLORS = [
-    "gray", "light_yellow", "yellow", "orange", "light_green", "green",
-    "dark_green", "cyan", "light_pink", "pink", "violet", "red",
-    "light_blue", "blue", "dark_blue", "black",
-]
 
 # Type-to-API-path mapping for updates
 TYPE_TO_PATH = {
@@ -45,12 +38,18 @@ TYPE_TO_PATH = {
 
 def _load_config():
     """Load Miro token from config file."""
-    global _config, _token
+    global _token
     config_path = Path.home() / ".miro-cli" / "config.json"
     if not config_path.exists():
-        raise FileNotFoundError(f"Miro config not found: {config_path}")
-    _config = json.loads(config_path.read_text())
-    _token = _config["token"]
+        raise FileNotFoundError("Miro not configured. Run: miro configure")
+    mode = config_path.stat().st_mode
+    if mode & (stat.S_IROTH | stat.S_IRGRP):
+        logger.warning(
+            "Config file %s has overly permissive permissions (%o). "
+            "Run: chmod 600 %s", config_path, mode & 0o777, config_path
+        )
+    config = json.loads(config_path.read_text())
+    _token = config["token"]
 
 
 async def _api(path, method="GET", body=None):
@@ -67,7 +66,7 @@ async def _api(path, method="GET", body=None):
     if body is not None:
         req.data = json.dumps(body).encode()
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         response = await loop.run_in_executor(
             None, lambda: urllib.request.urlopen(req, timeout=30)
@@ -79,9 +78,9 @@ async def _api(path, method="GET", body=None):
         error_body = ""
         try:
             error_body = e.read().decode()
-        except Exception:
-            pass
-        raise RuntimeError(f"Miro API {method} {path} returned {e.code}: {error_body}")
+        except Exception as exc:
+            logger.debug("Non-critical error: %s", exc)
+        raise RuntimeError(f"Miro API error {e.code}: {error_body[:500]}")
 
 
 async def _paginated_get(path, key="data", limit_per_page=50):
@@ -448,7 +447,6 @@ async def handle_create_sticky_note(params):
                         or ""
                     )
                     # Strip HTML tags for matching
-                    import re
                     plain = re.sub(r"<[^>]+>", "", item_content).lower()
                     if near_lower in plain:
                         # Score: prefer exact match > shorter content (more specific)
@@ -537,8 +535,8 @@ async def handle_create_sticky_note(params):
                         "y": center_y,
                         "origin": "center",
                     }
-        except Exception:
-            pass  # If scanning fails, let Miro use its default
+        except Exception as exc:
+            logger.debug("Smart positioning failed, using default: %s", exc)
 
     result = await _api(f"/boards/{board_id}/sticky_notes", method="POST", body=body)
     return {"success": True, "item": result}
@@ -653,8 +651,8 @@ async def handle_get_item_with_connections(params):
         try:
             ci = await _api(f"/boards/{board_id}/items/{cid}")
             connected_items[cid] = ci
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Non-critical error: %s", exc)
 
     connections = []
     for c in related_connectors:
@@ -696,25 +694,13 @@ async def handle_create_connector(params):
     }
     if params.get("shape"):
         body["shape"] = params["shape"]
-    if params.get("style"):
-        style = {}
-        if params.get("stroke_color"):
-            style["strokeColor"] = params["stroke_color"]
-        if params.get("stroke_width"):
-            style["strokeWidth"] = str(params["stroke_width"])
-        if style:
-            body["style"] = style
-    elif params.get("stroke_color") or params.get("stroke_width"):
-        style = {}
-        if params.get("stroke_color"):
-            style["strokeColor"] = params["stroke_color"]
-        if params.get("stroke_width"):
-            style["strokeWidth"] = str(params["stroke_width"])
+    style = {}
+    if params.get("stroke_color"):
+        style["strokeColor"] = params["stroke_color"]
+    if params.get("stroke_width"):
+        style["strokeWidth"] = str(params["stroke_width"])
+    if style:
         body["style"] = style
-    if params.get("start_cap"):
-        body["startItem"]["snapTo"] = "auto"
-    if params.get("end_cap"):
-        body["endItem"]["snapTo"] = "auto"
     captions = []
     if params.get("caption"):
         captions.append({"content": params["caption"]})
@@ -817,8 +803,8 @@ async def handle_get_items_in_frame(params):
     items = await _paginated_get(
         f"/boards/{board_id}/items?parent_item_id={frame_id}"
     )
-    compact = params.get("full", False)
-    result_items = items if compact else [_compact_item(i) for i in items]
+    full_mode = params.get("full", False)
+    result_items = items if full_mode else [_compact_item(i) for i in items]
     return {"items": result_items, "count": len(result_items), "frameId": frame_id}
 
 
@@ -1000,14 +986,14 @@ async def handle_export_graph(params):
         try:
             frame_item = await _api(f"/boards/{board_id}/items/{frame_id}")
             board_title = frame_item.get("data", {}).get("title", "")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Non-critical error: %s", exc)
     else:
         try:
             board_info = await _api(f"/boards/{board_id}")
             board_title = board_info.get("name", "")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Non-critical error: %s", exc)
 
     # Build item ID set for scoping edges
     item_ids = {item["id"] for item in items}
@@ -1083,21 +1069,29 @@ async def handle_import_graph(params):
     _on_stack = set()
     back_edges = set()
 
-    def _detect_cycles(nid):
-        _visited.add(nid)
-        _on_stack.add(nid)
-        for neighbor in adj.get(nid, []):
-            if neighbor not in node_ids:
-                continue
-            if neighbor in _on_stack:
-                back_edges.add((nid, neighbor))
-            elif neighbor not in _visited:
-                _detect_cycles(neighbor)
-        _on_stack.discard(nid)
-
+    # Iterative DFS to avoid RecursionError on large graphs
     for n in nodes:
-        if n["id"] not in _visited:
-            _detect_cycles(n["id"])
+        start = n["id"]
+        if start in _visited:
+            continue
+        stack = [(start, iter(adj.get(start, [])))]
+        _visited.add(start)
+        _on_stack.add(start)
+        while stack:
+            nid, neighbors = stack[-1]
+            try:
+                neighbor = next(neighbors)
+                if neighbor not in node_ids:
+                    continue
+                if neighbor in _on_stack:
+                    back_edges.add((nid, neighbor))
+                elif neighbor not in _visited:
+                    _visited.add(neighbor)
+                    _on_stack.add(neighbor)
+                    stack.append((neighbor, iter(adj.get(neighbor, []))))
+            except StopIteration:
+                _on_stack.discard(nid)
+                stack.pop()
 
     # Step 2: Build DAG adjacency (original edges minus back-edges)
     dag_adj = defaultdict(list)
@@ -1284,7 +1278,8 @@ async def handle_import_graph(params):
             else:
                 offset_x = 0
                 offset_y = 0
-        except Exception:
+        except Exception as exc:
+            logger.debug("Auto-position scan failed: %s", exc)
             offset_x = 0
             offset_y = 0
     else:
@@ -1477,8 +1472,9 @@ async def handle_board_diff(params):
 
     # 3. Save current as new snapshot
     try:
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         snapshot_file.write_text(json.dumps(current, indent=2))
+        snapshot_file.chmod(0o600)
     except Exception:
         pass
 

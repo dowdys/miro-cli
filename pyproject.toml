@@ -7,7 +7,8 @@ name = "miro-cli"
 version = "1.0.0"
 description = "Command-line tool for Miro board automation — 28 commands for boards, items, connectors, frames, and graph import/export"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+dependencies = []
 license = {text = "MIT"}
 authors = [{name = "Dowdy Sarvis"}]
 
