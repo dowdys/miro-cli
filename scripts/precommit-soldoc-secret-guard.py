@@ -23,13 +23,40 @@ FAIL CLOSED: for any solution doc we could not scan (scanner error / unavailable
 unreadable staged blob) we BLOCK rather than let an unverified doc through --
 better to block than to leak. Zero staged solution docs => pass fast (exit 0).
 
+HONEST DENOMINATOR (2026-08-26). ``--all`` prints the number of files it ACTUALLY
+examined, and that number is the scan loop's own iteration count -- never a
+second enumeration that could disagree with what was scanned. Before this, a run
+over 0 docs and a run over 3,988 docs emitted the identical string ("all tracked
+solution docs are clean"), so a guard aimed at a path holding no files was
+indistinguishable from a guard that looked and found nothing; only a timing
+side-channel (0.13s vs 1.41s) told them apart. A security control that reports
+clean when it examined nothing is the fabricated-clean shape in its most
+dangerous location.
+
+Zero WARNS, it does not FAIL, and that is deliberate:
+  * A red soldoc-secret-guard must mean "a secret was found". Failing on an empty
+    scope makes the same red also mean "this repo has no solution docs", and a
+    check whose red has two meanings stops being believed.
+  * The CI workflow's path filters mean a zero-doc repo only ever fires this job
+    on guard-maintenance commits, so a hard failure would paint every future
+    maintenance PR red in precisely the repos that most need the guard maintained
+    -- which trains people to bypass it.
+  * A repo can legitimately have no solution docs yet.
+Zero is still LOUD: a distinct message that never contains the word "clean", a
+GitHub Actions ``::warning`` annotation surfaced on the run and the PR, and a
+job-summary line. Where an operator has established that zero IS wrong for a
+given repo, arm ``--require-docs`` (or ``SOLDOC_GUARD_REQUIRE_DOCS=1``) and a
+zero-file scan becomes exit 2 there.
+
 Usage:
   precommit-soldoc-secret-guard.py [FILE ...]  # scan given files' STAGED content
   precommit-soldoc-secret-guard.py             # scan all staged sol-docs (diff --cached)
   precommit-soldoc-secret-guard.py --all       # scan every tracked sol-doc on disk (CI)
+  precommit-soldoc-secret-guard.py --all --require-docs  # ...and 0 files is an ERROR
 
 Exit codes: 0 = clean or no solution docs staged; 1 = a residual secret (or an
-unscannable solution doc) was found -> the commit is blocked.
+unscannable solution doc) was found -> the commit is blocked; 2 = --require-docs
+was armed and the scan examined ZERO files (an empty scope, NOT a secret).
 """
 from __future__ import annotations
 
@@ -396,10 +423,18 @@ def _sp_hard_findings(sp, content: str) -> List[dict]:
     return out
 
 
-def _run_all_mode() -> Tuple[dict, str]:
+def _run_all_mode() -> Tuple[dict, str, int]:
     """Scan every tracked docs/solutions/**/*.md on disk (CI). Returns
-    ``(offenders, label)``. Batched gitleaks UNION per-doc secret_patterns
-    HARD_BLOCK -- the SAME two detectors the authoritative scan composes."""
+    ``(offenders, label, scanned)``. Batched gitleaks UNION per-doc secret_patterns
+    HARD_BLOCK -- the SAME two detectors the authoritative scan composes.
+
+    ``scanned`` is the DENOMINATOR the caller reports. It is incremented as the
+    FIRST statement of the per-doc loop body on every path that touches docs, so
+    it counts iterations of the loop that does the scanning. It is deliberately
+    NOT ``len(glob(...))``, not a re-run of ``_all_tracked_soldocs()``, and not a
+    ``len(docs)`` taken elsewhere: a counter that can drift from the thing it
+    counts is a brand-new fabricated-clean surface, which would be an absurd way
+    to fix a fabricated-clean bug."""
     _setup_ai_infra_path()
     sp = _import_secret_patterns()
     try:
@@ -407,9 +442,10 @@ def _run_all_mode() -> Tuple[dict, str]:
     except Exception:
         git_root = os.getcwd()
 
+    scanned = 0
     docs = _all_tracked_soldocs()
     if not docs:
-        return {}, "no solution docs"
+        return {}, "no solution docs", scanned
 
     # Absolute scan root: gitleaks then emits absolute `File` paths and the pass no
     # longer depends on cwd == git_root (both sides are realpath-normalized anyway).
@@ -428,20 +464,27 @@ def _run_all_mode() -> Tuple[dict, str]:
                   if sp is None else
                   "authoritative gitleaks scan could not run; the in-process regex "
                   "layer is NOT an accepted substitute")
-        offenders = {p: [{"rule": "SCANNER_UNAVAILABLE", "fingerprint": "",
-                          "source": "guard", "detail": detail}] for p in docs}
-        if sp is not None:
-            for p in docs:
-                try:
-                    extra = _sp_hard_findings(sp, _read_disk(p))
-                except Exception:
-                    extra = []
-                if extra:
-                    offenders[p].extend(extra)
-        return offenders, "UNAVAILABLE gitleaks (fail-closed)"
+        offenders = {}
+        for p in docs:
+            scanned += 1
+            offenders[p] = [{"rule": "SCANNER_UNAVAILABLE", "fingerprint": "",
+                             "source": "guard", "detail": detail}]
+            if sp is None:
+                continue
+            # MOVED, not new: this line came from the dict-comprehension form
+            # below. The path is ALREADY blocking, so a secondary-scanner error
+            # must not mask the block it is only decorating.
+            try:
+                extra = _sp_hard_findings(sp, _read_disk(p))
+            except Exception:  # noqa: BLE001 - see comment above
+                extra = []
+            if extra:
+                offenders[p].extend(extra)
+        return offenders, "UNAVAILABLE gitleaks (fail-closed)", scanned
 
     offenders: dict = {}
     for p in docs:
+        scanned += 1
         findings: List[dict] = []
         try:
             findings.extend(_sp_hard_findings(sp, _read_disk(p)))
@@ -476,7 +519,7 @@ def _run_all_mode() -> Tuple[dict, str]:
         )
 
     label = "all-mode (gitleaks" + ("+secret_patterns" if sp is not None else " only") + ")"
-    return offenders, label
+    return offenders, label, scanned
 
 
 # --------------------------------------------------------------------------- #
@@ -514,21 +557,71 @@ def _print_block(offenders: dict, label: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# The --all verdict: a count, always, and a DIFFERENT string when it is zero.
+# --------------------------------------------------------------------------- #
+ZERO_SCAN_MSG = (
+    "soldoc-secret-guard: scanned 0 files -- NOTHING WAS EXAMINED. "
+    "This repository has no tracked docs/solutions/**/*.md, so the guard is "
+    "aimed at an empty path. This is NOT a verdict about content: either the "
+    "watched path is wrong for this repo, or the guard does not belong here."
+)
+# NOTE: ZERO_SCAN_MSG must never contain the word "clean" -- a test asserts it,
+# because the whole defect was a zero-file run reading as a clean bill of health.
+
+
+def _emit_all_verdict(scanned: int) -> None:
+    """Report the --all verdict WITH its denominator.
+
+    The zero case and the non-zero case emit different strings on purpose -- the
+    defect this closes is that they used to emit the same one. Nothing here
+    re-derives ``scanned``; it is passed in from the scan loop that produced it.
+    """
+    if scanned == 0:
+        # Loud, three ways: a distinct message that never says "clean", a GitHub
+        # annotation on the run + PR, and a job-summary line. Exit stays 0 --
+        # see the module docstring for why zero warns rather than fails.
+        print(ZERO_SCAN_MSG)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print("::warning title=soldoc-secret-guard scanned 0 files::"
+                  + ZERO_SCAN_MSG)
+            summary = os.environ.get("GITHUB_STEP_SUMMARY")
+            if summary:
+                try:
+                    with open(summary, "a", encoding="utf-8") as fh:
+                        fh.write("### :warning: soldoc-secret-guard scanned **0** files\n\n"
+                                 + ZERO_SCAN_MSG + "\n")
+                except OSError:
+                    pass  # a summary we cannot write must never mask the stdout line
+        return
+    print(f"soldoc-secret-guard: scanned {scanned} files -- all clean.")
+
+
+# --------------------------------------------------------------------------- #
 # Main.
 # --------------------------------------------------------------------------- #
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(add_help=True, description="Block committing an unredacted solution doc.")
     ap.add_argument("--all", action="store_true",
                     help="scan every tracked docs/solutions/**/*.md on disk (CI mode)")
+    ap.add_argument("--require-docs", action="store_true",
+                    default=os.environ.get("SOLDOC_GUARD_REQUIRE_DOCS") == "1",
+                    help="with --all: exit 2 if the scan examined ZERO files. Arm this "
+                         "in a repo where an empty docs/solutions/ is known to be wrong.")
     ap.add_argument("files", nargs="*", help="staged files to scan (pre-commit passes these)")
     args = ap.parse_args(argv)
 
     if args.all:
         # CI whole-tree mode: batched gitleaks + per-doc secret_patterns.
-        offenders, label = _run_all_mode()
+        offenders, label, scanned = _run_all_mode()
         if offenders:
             _print_block(offenders, label)
             return 1
+        _emit_all_verdict(scanned)
+        if scanned == 0 and args.require_docs:
+            sys.stderr.write(
+                "[soldoc-guard] --require-docs is armed and the scan examined 0 files.\n"
+            )
+            return 2
         return 0
 
     if args.files:
