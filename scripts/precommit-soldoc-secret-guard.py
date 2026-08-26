@@ -48,6 +48,11 @@ job-summary line. Where an operator has established that zero IS wrong for a
 given repo, arm ``--require-docs`` (or ``SOLDOC_GUARD_REQUIRE_DOCS=1``) and a
 zero-file scan becomes exit 2 there.
 
+SCOPE: the watched path is the SCOPE_ROOTS / SCOPE_SUFFIXES pair defined below,
+defaulting to ``docs/solutions`` + ``.md``. This repo may have widened it; read
+the constants, not this sentence. Nothing in this file inspects frontmatter --
+scope is a PATH decision end to end.
+
 Usage:
   precommit-soldoc-secret-guard.py [FILE ...]  # scan given files' STAGED content
   precommit-soldoc-secret-guard.py             # scan all staged sol-docs (diff --cached)
@@ -72,8 +77,65 @@ import tempfile
 from pathlib import Path
 from typing import Callable, List, Tuple
 
-# A staged path is a "solution doc" iff it matches this (repo-root-relative).
-SOLDOC_RE = re.compile(r"^docs/solutions/.*\.md$")
+# --------------------------------------------------------------------------- #
+# SCAN SCOPE -- what this guard SEES is decided by PATH, and by nothing else.
+#
+# There is NO frontmatter parsing anywhere in this file and never has been. A
+# file is in scope iff its repo-root-relative path sits under one of
+# SCOPE_ROOTS and ends with one of SCOPE_SUFFIXES. Adding `title:` / `module:`
+# / `tags:` / `problem_type:` frontmatter to a document does NOT bring it into
+# scope -- that schema belongs to the solution INDEXER (semantic search), not
+# to this scanner. Widening coverage means widening the PATH: here, AND in the
+# workflow's `on.push.paths` filter, or the guard keeps reporting an honest
+# zero on a repo whose real documents live somewhere else.
+#
+# SCOPE_ROOTS entries are repo-root-relative directory prefixes; "." means the
+# whole tracked tree. SCOPE_SUFFIXES entries are filename suffixes; a single
+# "*" means every tracked file under the roots. The env overrides exist for
+# testing and one-off widening; the committed constants are this repo's real
+# policy, so a reviewer reads the scope out of the diff.
+SCOPE_ROOTS = ['.']
+SCOPE_SUFFIXES = ['*']
+
+
+def _scope_roots() -> List[str]:
+    raw = os.environ.get("SOLDOC_GUARD_ROOTS")
+    vals = raw.split(",") if raw else list(SCOPE_ROOTS)
+    out = [v.strip().rstrip("/") for v in vals if v.strip()]
+    out = [v if v else "." for v in out]
+    return out or ["docs/solutions"]
+
+
+def _scope_suffixes() -> List[str]:
+    raw = os.environ.get("SOLDOC_GUARD_SUFFIXES")
+    vals = raw.split(",") if raw else list(SCOPE_SUFFIXES)
+    out = [v.strip() for v in vals if v.strip()]
+    return out or [".md"]
+
+
+def _scope_desc() -> str:
+    """Human-readable scope, quoted in the verdict so the log never implies a
+    path the guard is not actually watching."""
+    sufs = _scope_suffixes()
+    what = "any tracked file" if "*" in sufs else "tracked " + "/".join(sufs) + " files"
+    roots = ", ".join(r if r != "." else "the whole tree" for r in _scope_roots())
+    return f"{what} under {roots}"
+
+
+def _in_scope(path: str) -> bool:
+    """True iff ``path`` (repo-root-relative) is inside the configured scope."""
+    if not path:
+        return False
+    p = path.replace(os.sep, "/")
+    if p.startswith("./"):
+        p = p[2:]
+    sufs = _scope_suffixes()
+    if "*" not in sufs and not any(p.endswith(s) for s in sufs):
+        return False
+    for root in _scope_roots():
+        if root == "." or p == root or p.startswith(root + "/"):
+            return True
+    return False
 
 REMEDIATION = (
     "Remediation: the doc still holds a live secret shape. Re-run the solution-doc\n"
@@ -289,13 +351,14 @@ def _git(args: List[str]) -> str:
 
 
 def _staged_soldocs() -> List[str]:
-    out = _git(["diff", "--cached", "--name-only", "--diff-filter=ACMR", "--", "docs/solutions"])
-    return [p for p in out.splitlines() if p and SOLDOC_RE.match(p)]
+    out = _git(["diff", "--cached", "--name-only", "--diff-filter=ACMR",
+                "--", *_scope_roots()])
+    return [p for p in out.splitlines() if _in_scope(p)]
 
 
 def _all_tracked_soldocs() -> List[str]:
-    out = _git(["ls-files", "--", "docs/solutions"])
-    return [p for p in out.splitlines() if p and SOLDOC_RE.match(p)]
+    out = _git(["ls-files", "--", *_scope_roots()])
+    return [p for p in out.splitlines() if _in_scope(p)]
 
 
 def _read_staged(path: str) -> str:
@@ -447,10 +510,28 @@ def _run_all_mode() -> Tuple[dict, str, int]:
     if not docs:
         return {}, "no solution docs", scanned
 
-    # Absolute scan root: gitleaks then emits absolute `File` paths and the pass no
-    # longer depends on cwd == git_root (both sides are realpath-normalized anyway).
-    scan_root = os.path.join(git_root, "docs", "solutions")
-    gl_by_file, gl_ok, gl_unmapped = _gitleaks_dir_findings(scan_root, git_root, sp, docs)
+    # ONE gitleaks pass PER SCOPE ROOT, absolute so gitleaks emits absolute `File`
+    # paths and the pass does not depend on cwd == git_root (both sides are
+    # realpath-normalized anyway). If ANY root fails to scan, the WHOLE pass is
+    # not-ok and the fail-closed branch below blocks: a partially scanned tree
+    # must never render as a clean one.
+    gl_by_file: dict = {}
+    gl_unmapped: list = []
+    gl_ok = True
+    for _root in _scope_roots():
+        scan_root = git_root if _root == "." else os.path.join(git_root, *_root.split("/"))
+        if not os.path.isdir(scan_root):
+            # A configured root that does not exist on disk scans nothing. That is
+            # not an error (a repo may adopt a root before creating it) and it
+            # cannot inflate the count: `docs` came from git, not from this walk.
+            continue
+        _by_file, _ok, _unmapped = _gitleaks_dir_findings(scan_root, git_root, sp, docs)
+        if not _ok:
+            gl_ok = False
+            break
+        for _k, _v in _by_file.items():
+            gl_by_file.setdefault(_k, []).extend(_v)
+        gl_unmapped.extend(_unmapped)
 
     # FAIL CLOSED (F1): gitleaks is the AUTHORITATIVE out-of-process blocking scanner
     # on the --all path, exactly as it is on the per-file path. If it could not run
@@ -559,14 +640,21 @@ def _print_block(offenders: dict, label: str) -> None:
 # --------------------------------------------------------------------------- #
 # The --all verdict: a count, always, and a DIFFERENT string when it is zero.
 # --------------------------------------------------------------------------- #
-ZERO_SCAN_MSG = (
-    "soldoc-secret-guard: scanned 0 files -- NOTHING WAS EXAMINED. "
-    "This repository has no tracked docs/solutions/**/*.md, so the guard is "
-    "aimed at an empty path. This is NOT a verdict about content: either the "
-    "watched path is wrong for this repo, or the guard does not belong here."
-)
-# NOTE: ZERO_SCAN_MSG must never contain the word "clean" -- a test asserts it,
-# because the whole defect was a zero-file run reading as a clean bill of health.
+def _zero_scan_msg() -> str:
+    """The zero verdict, naming the scope it ACTUALLY watched. Hardcoding
+    "docs/solutions/**/*.md" here would be fabricated-clean-in-prose the moment
+    a repo widens its scope: the log would name a path the scan never used."""
+    return (
+        "soldoc-secret-guard: scanned 0 files -- NOTHING WAS EXAMINED. "
+        f"This repository has no {_scope_desc()}, so the guard is "
+        "aimed at an empty path. This is NOT a verdict about content: either the "
+        "watched path is wrong for this repo, or the guard does not belong here."
+    )
+
+
+# NOTE: the zero message must never contain the word "clean" -- a test asserts
+# it, because the whole defect was a zero-file run reading as a clean bill of
+# health.
 
 
 def _emit_all_verdict(scanned: int) -> None:
@@ -580,20 +668,24 @@ def _emit_all_verdict(scanned: int) -> None:
         # Loud, three ways: a distinct message that never says "clean", a GitHub
         # annotation on the run + PR, and a job-summary line. Exit stays 0 --
         # see the module docstring for why zero warns rather than fails.
-        print(ZERO_SCAN_MSG)
+        zero_msg = _zero_scan_msg()
+        print(zero_msg)
         if os.environ.get("GITHUB_ACTIONS") == "true":
             print("::warning title=soldoc-secret-guard scanned 0 files::"
-                  + ZERO_SCAN_MSG)
+                  + zero_msg)
             summary = os.environ.get("GITHUB_STEP_SUMMARY")
             if summary:
                 try:
                     with open(summary, "a", encoding="utf-8") as fh:
                         fh.write("### :warning: soldoc-secret-guard scanned **0** files\n\n"
-                                 + ZERO_SCAN_MSG + "\n")
+                                 + zero_msg + "\n")
                 except OSError:
                     pass  # a summary we cannot write must never mask the stdout line
         return
     print(f"soldoc-secret-guard: scanned {scanned} files -- all clean.")
+    # The count alone does not say WHAT was counted. Print the scope beside it so
+    # a reader can reconcile N against `git ls-files` without opening this file.
+    print(f"soldoc-secret-guard: scope = {_scope_desc()}")
 
 
 # --------------------------------------------------------------------------- #
@@ -625,7 +717,7 @@ def main(argv: List[str]) -> int:
         return 0
 
     if args.files:
-        paths = [p for p in args.files if SOLDOC_RE.match(p)]
+        paths = [p for p in args.files if _in_scope(p)]
     else:
         paths = _staged_soldocs()
     reader = _read_staged
